@@ -1,12 +1,12 @@
 # MediaMesh — Enterprise Media Discovery Platform
 
-**Solution design proposal | Stakeholder review | Version 0.2 | 8 November 2026**  
+**Solution design proposal | Stakeholder review | Version 0.1 | 7 November 2026**  
 **Illustrative organization:** National Geographic (NatGeo-style use case; not an actual NatGeo integration)  
 **Status:** Proposed architecture — decisions pending
 
 ## 1. Executive summary
 
-MediaMesh is a secure internal media library where authorized employees upload photographs and videos, while authorized researchers use natural-language queries to locate relevant assets. An administrator assigns application roles. Employees authenticate through enterprise single sign-on (SSO); APIs validate JWT access tokens and enforce role-based access control (RBAC). Original files are held privately in Amazon S3. Metadata and vector embeddings are stored in PostgreSQL with pgvector. A standalone Python ML service provides CLIP-based multimodal embeddings, video-keyframe indexing, and semantic similarity retrieval.
+MediaMesh is a secure internal media library where authorized employees upload photographs and videos, while authorized researchers use natural-language queries to locate relevant assets. An administrator assigns application roles. Employees authenticate through enterprise single sign-on (SSO); APIs validate JWT access tokens and enforce role-based access control (RBAC). Original files are held privately in Amazon S3. Metadata and vector embeddings are stored in PostgreSQL with pgvector. A Python ML service, adapted from the existing REEL-FINDER recommendation engine, provides semantic retrieval.
 
 **MVP objective:** Demonstrate one complete, secure enterprise workflow: **SSO → admin role assignment → authorized media upload → automatic indexing → authorized semantic search → secure preview/download**.
 
@@ -55,18 +55,14 @@ flowchart TB
     WORKER[Background indexer<br/>Python worker or task runner]
 
     U --> UI
-    UI -->|OIDC sign-in| IDP
-    IDP -->|Authentication response| UI
+    UI <-->|OIDC sign-in| IDP
     UI -->|Bearer JWT + HTTPS| API
-    API -->|Fetch public signing keys as needed| IDP
-    API -->|Read and write users, roles, assets, jobs| DB
-    DB -->|Metadata and authorization results| API
-    API -->|Request presigned upload/download URLs| S3
-    UI -->|Upload/download using presigned URL| S3
-    S3 -->|Media response| UI
+    API -->|Validate JWT signature / claims| IDP
+    API <-->|Roles, metadata, status, vectors| DB
+    API -->|Issue limited S3 upload/download URLs| S3
+    UI <-->|Upload/download with presigned URL| S3
     API -->|Authorize and request search| ML
-    ML -->|Vector similarity queries| DB
-    DB -->|Ranked vector matches| ML
+    ML <-->|Vector queries / indexing| DB
     WORKER -->|Fetch uploaded files| S3
     WORKER -->|Generate embeddings| ML
     WORKER -->|Update job and asset status| DB
@@ -119,13 +115,13 @@ sequenceDiagram
     IdP-->>Web: Authorization code
     Web->>IdP: Exchange code securely for tokens
     IdP-->>Web: ID/access tokens and expiry
-    Web->>API: GET /api/me with access JWT
+    Web->>API: GET /me with access JWT
     API->>API: Validate signature, issuer, audience, expiry
     API->>DB: Load current roles by identity subject
     DB-->>API: Assigned roles
     API-->>Web: Identity and authorized capabilities
     Note over Web,IdP: Token/session expiry controlled by IdP and app settings
-    alt Access token expires and refresh is permitted
+    alt Access token expires; refresh is permitted
         Web->>IdP: Renew using supported secure session mechanism
         IdP-->>Web: New short-lived access token
     else Renewal not available / session expired
@@ -145,19 +141,19 @@ sequenceDiagram
     participant API as Spring Boot API
     participant DB as PostgreSQL
     Admin->>Web: Open User Management
-    Web->>API: GET /api/admin/users with access JWT
+    Web->>API: GET /admin/users (access JWT)
     API->>API: Validate JWT and require ADMIN role
     API->>DB: Read users and role assignments
     DB-->>API: User list
     API-->>Web: User/role data
     Admin->>Web: Assign UPLOADER or RESEARCHER
-    Web->>API: PUT /api/admin/users/{id}/roles
+    Web->>API: PUT /admin/users/{id}/roles
     API->>API: Validate JWT and require ADMIN role
     API->>DB: Save role assignment and audit event
     DB-->>API: Commit successful
     API-->>Web: Updated roles
-    Note over API,DB: Next request reads current roles
-    Note over API,DB: Changes apply before JWT expiry
+    Note over API,DB: Next protected request reads current roles;
+    Note over API,DB: changes take effect without waiting for JWT expiry.
 ```
 
 **Failure behavior:** A user without `ADMIN` gets HTTP `403`. Missing/expired/invalid JWT gets HTTP `401`. Admin cannot grant arbitrary unsupported role names.
@@ -175,16 +171,16 @@ sequenceDiagram
     participant Worker as Indexing Worker
     participant ML as Python ML Service
     Uploader->>Web: Select image/video and enter metadata
-    Web->>API: POST /api/assets/initiate with JWT and metadata
+    Web->>API: POST /assets/upload-request (JWT, file metadata)
     API->>API: Validate JWT and require UPLOADER
     API->>DB: Create asset with UPLOADING status
     API-->>Web: Asset ID + short-lived S3 upload URL
     Web->>S3: Upload bytes directly via presigned URL
     S3-->>Web: Upload success
-    Web->>API: POST /api/assets/{id}/complete with JWT
+    Web->>API: POST /assets/{id}/complete (JWT)
     API->>S3: Verify object exists / expected type and size
     API->>DB: Commit asset PROCESSING + durable indexing job
-    API-->>Web: Accepted with PROCESSING status
+    API-->>Web: Accepted; status PROCESSING
     Worker->>DB: Claim next pending indexing job
     Worker->>S3: Read asset (private service credentials)
     opt Video
@@ -192,12 +188,12 @@ sequenceDiagram
     end
     Worker->>ML: Generate CLIP image/frame embeddings
     ML-->>Worker: Embeddings
-    Worker->>DB: Upsert vectors and mark asset READY
-    Web->>API: GET /api/assets/{id}/status with JWT
+    Worker->>DB: Upsert vectors; mark asset READY and job complete
+    Web->>API: GET /assets/{id}/status (JWT)
     API-->>Web: READY
     alt Processing fails
         Worker->>DB: Record failure and retry count
-        Note over Worker,DB: Retry with bounded attempts and mark FAILED after limit
+        Note over Worker,DB: Bounded retry; status FAILED after limit
     end
 ```
 
@@ -214,7 +210,7 @@ sequenceDiagram
     participant DB as PostgreSQL
     participant ML as Python ML Service
     Researcher->>Web: Search "elephants near a watering hole"
-    Web->>API: POST /api/search with query and JWT
+    Web->>API: GET /search?q=... (JWT)
     API->>API: Validate JWT and require RESEARCHER
     API->>DB: Resolve user's allowed asset scope
     DB-->>API: Effective visibility rules
@@ -229,7 +225,7 @@ sequenceDiagram
     Note over Web,API: Never return unauthorized asset IDs, metadata or URLs.
 ```
 
-**MVP retrieval:** CLIP-compatible text and image embeddings are in the same space. Images have one or more vectors; videos are indexed using a limited number of keyframes. The standalone Python ML service encodes natural-language queries and stored images using a compatible CLIP model, ranks candidates via pgvector, and returns only asset IDs, scores, and frame timestamps to the Spring Boot API. A user can request **related media** by searching with the chosen asset's embedding.
+**MVP retrieval:** CLIP-compatible text and image embeddings are in the same space. Images have one or more vectors; videos are indexed using a limited number of keyframes. The existing REEL-FINDER request/embedding/similarity/ranking structure is reused, but movie-specific scoring, data files and MiniLM embeddings must be replaced or adapted. A user can request **related media** by searching with the chosen asset's embedding.
 
 ### Flow E — Authorized preview/download, expiration and denial
 
@@ -242,7 +238,7 @@ sequenceDiagram
     participant DB as PostgreSQL
     participant S3 as Private S3
     Researcher->>Web: Open a search result
-    Web->>API: POST /api/assets/{id}/access-url with JWT
+    Web->>API: POST /assets/{id}/access-url (JWT)
     API->>API: Validate JWT and require RESEARCHER
     API->>DB: Verify this asset is visible to the user
     alt Authorized
@@ -254,7 +250,7 @@ sequenceDiagram
         DB-->>API: Denied
         API-->>Web: 403 Forbidden
     end
-    Note over Web,S3: Presigned URLs expire, S3 objects remain private.
+    Note over Web,S3: Presigned URLs expire; S3 objects remain private.
 ```
 
 **Important limitation:** An already issued S3 presigned URL can remain usable until its short expiry even if an admin revokes access moments later. Keep expiry brief and do not expose URLs to unrelated users. Stronger immediate revocation would require proxying content through a permission-checking service, which is outside this MVP.
@@ -308,48 +304,21 @@ erDiagram
 
 For the lean MVP, roles are application-managed; user authentication remains managed by the IdP. Add `collection_id` and collection membership/visibility data **only if** restricted collections are approved as required scope. Avoid implementing asset-specific grants and multi-tenancy by default.
 
-## 8. Standalone multimodal semantic retrieval service
+## 8. Reuse from REEL-FINDER
 
-The Python ML service is a **standalone MediaMesh component** built for the NatGeo-style media library. It exposes internal endpoints to the Spring Boot API and runs a background worker to index uploaded media. The browser cannot invoke the ML API directly.
+**Source:** [REEL-FINDER recommendation-engine README](https://github.com/mathewpius19/REEL-FINDER/blob/main/recommendation-engine/README.md). This proposal reuses the architecture previously discussed, not an audited line-by-line source-code inventory.
 
-| Component | MVP responsibility |
+| Existing idea | MVP disposition |
 |---|---|
-| Python Flask API | Implement internal semantic search and optional related-media retrieval |
-| CLIP-compatible model | Generate text and image embeddings in one shared vector space |
-| FFmpeg keyframe extractor | Sample a limited number of frames from short video clips and record timestamps |
-| PostgreSQL + pgvector | Persist versioned asset/frame vectors and run similarity queries |
-| Background indexing worker | Claim durable jobs, fetch media privately from S3, upsert vectors, and update processing status |
-| Ranking and retrieval | Return ranked asset IDs, similarity scores, and optional video timestamps |
+| Python/Flask ML service and REST integration | Reuse and refactor |
+| Sentence Transformers model loading | Reuse framework; move to multimodal CLIP |
+| Semantic retrieval and result ranking | Reuse pattern and compatible code |
+| FAISS | Optional prototype only; final choice is pgvector to reduce moving parts |
+| Ollama + FastMCP agent | Defer; direct text-to-image search suffices |
+| Movie metadata, history, genre-based weighting | Not reused directly |
+| Related-content recommendation | Reuse vector-neighbor search for similar assets |
 
-### Internal ML contract
-
-`POST /internal/search` accepts a natural-language query and requested result limit. It returns only ranked candidates; it does not issue public media links or decide user roles.
-
-```json
-{
-  "query": "elephants drinking at a watering hole at sunset",
-  "limit": 20
-}
-```
-
-```json
-{
-  "matches": [
-    {"assetId": "example-asset-id", "score": 0.83, "frameTimestampSeconds": 72},
-    {"assetId": "example-image-id", "score": 0.79, "frameTimestampSeconds": null}
-  ]
-}
-```
-
-The Spring Boot endpoint `POST /api/search` performs JWT and role validation, calls the internal ML endpoint, and performs a final authorized asset and metadata lookup before returning results to the user. The ML endpoint stays private. **No existing external recommendation engine is a documented project dependency.**
-
-### Model and indexing constraints
-
-- Use one explicitly versioned compatible CLIP text/image model and record embedding dimensionality in configuration and migrations.
-- Generate one vector for an image and separately indexed timestamped keyframes for videos.
-- Support idempotent reindexing by asset, model version, and frame position.
-- Keep only a small evaluation set of images/videos for the MVP; avoid native audio embeddings and expensive video understanding.
-- Teammate 2 owns asset metadata and indexing-job schema; Teammate 3 owns vectors, ML inference, and worker execution. Agree on job claiming and state transitions before integration.
+**Model migration:** Existing movie/text embeddings are not compatible by default with CLIP visual vectors; regenerate the MediaMesh index using a single versioned compatible text/image model. Check retrieval quality on a small curated image/video dataset before committing to the model.
 
 ## 9. Security, failure handling and operating assumptions
 
@@ -398,6 +367,6 @@ The Spring Boot endpoint `POST /api/search` performs JWT and role validation, ca
 
 ## 12. Non-goals and project success boundary
 
-MediaMesh is **not** rebuilding S3, training a multimodal foundation model, building a generalized autonomous agent, or delivering a production-grade National Geographic integration. It is a demonstrable enterprise-style application built around managed identity, role-enforced APIs, secure media storage and a standalone multimodal semantic retrieval service.
+MediaMesh is **not** rebuilding S3, training a multimodal foundation model, building a generalized autonomous agent, or delivering a production-grade National Geographic integration. It is a demonstrable enterprise-style application built around managed identity, role-enforced APIs, secure media storage and reused semantic retrieval software.
 
 **MVP is complete when the end-to-end demonstration works securely, is reproducible, and meets the acceptance criteria in §10.**
