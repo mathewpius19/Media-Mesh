@@ -80,10 +80,10 @@ sequenceDiagram
     IdP-->>UI: Authenticated session / tokens
     UI->>API: GET /api/me with access JWT
     API->>API: Validate signature, issuer, audience, expiry
-    API->>DB: Find/provision user; read assigned roles
+    API->>DB: Find/provision user, read assigned roles
     DB-->>API: Current roles
     API-->>UI: User profile + roles
-    Note over UI,API: Expired/invalid access token returns 401; renew or reauthenticate
+    Note over UI,API: Expired/invalid access token returns 401, renew or reauthenticate
 ```
 
 ### 2. Admin assigns access
@@ -126,7 +126,7 @@ sequenceDiagram
     Worker->>DB: Claim pending job
     Worker->>S3: Read image/video
     Worker->>Worker: CLIP image / sampled frame embeddings
-    Worker->>DB: Store vectors; set READY
+    Worker->>DB: Store vectors, set READY
 ```
 
 ### 4. Researcher searches by natural language
