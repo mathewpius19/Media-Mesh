@@ -182,10 +182,6 @@ sequenceDiagram
 | Local development | Docker Compose | Service reproducibility, not production orchestration |
 | CI | Jenkins + GitHub | Build, unit and integration tests |
 
-## REEL-FINDER reuse
-
-This project **plans to reuse**, not claim to have integrated, the existing [REEL-FINDER recommendation-engine](https://github.com/mathewpius19/REEL-FINDER/tree/main/recommendation-engine) architecture: Python service structure, embedding/search pipeline and similarity ranking. The text-only model/FAISS implementation will be adapted for CLIP multimodal embeddings and the chosen pgvector persistence layer. Ollama/MCP and user-behavior-based recommendations are not needed for the MVP.
-
 ## Repo organization
 
 ```text
