@@ -1,0 +1,50 @@
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.key
+*credentials*
+
+# Java / Gradle / Maven
+backend/target/
+backend/build/
+.gradle/
+*.class
+
+# Python / ML
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+*.faiss
+*.index
+models/
+checkpoints/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/build/
+
+# Local IDE / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Local data and artifacts
+*.log
+*.sqlite
+*.sqlite3
+coverage/
+htmlcov/
+*.mp4
+*.mov
+*.wav
+*.jpg
+*.jpeg
+*.png
+*.webp
