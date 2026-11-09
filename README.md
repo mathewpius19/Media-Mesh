@@ -26,27 +26,28 @@ MediaMesh is a secure, searchable media library for editorial teams. A wildlife 
 
 ```mermaid
 flowchart TB
-    STAFF["NatGeo Editorial Staff<br/>Admin / Uploader / Researcher"]
-    WEB["React Editorial Portal"]
-    IDP["Enterprise SSO<br/>OIDC Provider"]
-    API["Spring Boot API<br/>JWT Validation + RBAC + Catalog"]
-    PG[("PostgreSQL + pgvector<br/>Users / Roles / Assets / Vectors")]
-    S3[("Private Amazon S3<br/>Photos + Videos")]
-    ML["Python ML Service<br/>Sentence Transformers + CLIP"]
-    WORK["Python Indexing Worker<br/>Metadata + Image/Keyframes"]
+    STAFF["NatGeo editorial staff"]
+    WEB["React editorial portal"]
+    IDP["OIDC identity provider"]
+    API["Spring Boot API - JWT, RBAC, catalog"]
+    PG[("PostgreSQL and pgvector")]
+    S3[("Private Amazon S3 bucket")]
+    ML["Python semantic search service"]
+    WORK["Python media indexing worker"]
 
     STAFF --> WEB
-    WEB <-->|OIDC sign-in| IDP
-    WEB -->|Bearer JWT / HTTPS| API
-    API <-->|Metadata + roles + jobs| PG
-    API -->|Issue authorized presigned URLs| WEB
-    WEB <-->|Upload / preview by signed URL| S3
-    API -->|Semantic query| ML
-    ML <-->|Vector retrieval| PG
-    WORK -->|Claim pending job| PG
-    WORK -->|Read uploaded media| S3
-    WORK -->|Embed content| ML
-    WORK -->|Persist vectors + state| PG
+    WEB -->|Sign in| IDP
+    IDP -->|OIDC tokens| WEB
+    WEB -->|Authenticated HTTPS API requests| API
+    API -->|Read and write records| PG
+    API -->|Request semantic search| ML
+    ML -->|Search embeddings| PG
+    API -->|Return presigned URL| WEB
+    WEB -->|Upload or retrieve media| S3
+    WORK -->|Claim indexing jobs| PG
+    WORK -->|Read media| S3
+    WORK -->|Generate embeddings| ML
+    WORK -->|Persist vectors and status| PG
 ```
 
 **Security boundary:** The browser never accesses internal Python endpoints directly. The backend validates JWTs and verifies current role assignments for each protected action. S3 objects are private. Presigned URLs are scoped and short-lived; role revocation cannot invalidate an already-issued URL before it expires.
@@ -94,7 +95,7 @@ sequenceDiagram
     participant API as Spring Boot
     participant DB as PostgreSQL
     Admin->>UI: Select employee and roles
-    UI->>API: PUT /api/admin/users/{id}/roles
+    UI->>API: PUT admin roles endpoint
     API->>API: Verify JWT + current ADMIN role
     API->>DB: Replace roles and append audit event
     DB-->>API: Committed assignments
@@ -118,7 +119,7 @@ sequenceDiagram
     API->>DB: Create asset status UPLOADING
     API-->>UI: Presigned upload URL + asset ID
     UI->>S3: PUT media using short-lived URL
-    UI->>API: POST /api/assets/{id}/complete
+    UI->>API: POST complete upload endpoint
     API->>S3: Verify uploaded object
     API->>DB: Create retryable indexing job
     API-->>UI: 202 PROCESSING
@@ -158,7 +159,7 @@ sequenceDiagram
     participant DB as PostgreSQL
     participant S3 as Private S3 Bucket
     Researcher->>UI: Open matching asset
-    UI->>API: POST /api/assets/{id}/access-url
+    UI->>API: POST asset access URL endpoint
     API->>API: Validate JWT and RESEARCHER role
     API->>DB: Ensure asset exists and is READY
     API-->>UI: Short-lived S3 GET URL
