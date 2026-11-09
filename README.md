@@ -177,7 +177,7 @@ sequenceDiagram
 | Media storage | Amazon S3 | Private object bucket; signed upload/download |
 | Structured database | PostgreSQL | Users, roles, assets, indexing jobs, audit events |
 | Vector database | pgvector | Vectors in the existing PostgreSQL database |
-| ML retrieval | Python / Flask, Sentence Transformers / CLIP | Adapt relevant code from REEL-FINDER |
+| ML retrieval | Python / Flask, Sentence Transformers / CLIP | Standalone multimodal embedding and semantic retrieval service |
 | Video indexing | FFmpeg | Sample keyframes, report approximate matching timestamp |
 | Local development | Docker Compose | Service reproducibility, not production orchestration |
 | CI | Jenkins + GitHub | Build, unit and integration tests |
