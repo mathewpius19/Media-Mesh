@@ -1,316 +1,403 @@
-# MediaMesh for National Geographic — Stakeholder Design Proposal
+# MediaMesh — Enterprise Media Discovery Platform
 
-**Version:** 0.2 | **Status:** For scope approval | **Date:** 7 November 2026  
-**Customer scenario:** A *hypothetical* National Geographic (NatGeo) editorial media library; this is a proposed student-project use case, not a description of NatGeo's actual internal software, security policies, or workflows.
+**Solution design proposal | Stakeholder review | Version 0.2 | 8 November 2026**  
+**Illustrative organization:** National Geographic (NatGeo-style use case; not an actual NatGeo integration)  
+**Status:** Proposed architecture — decisions pending
 
-## 1. Decision we are asking stakeholders to make
+## 1. Executive summary
 
-**Approve a lean MVP:** A secure internal library in which NatGeo media contributors upload wildlife photos and documentary clips; NatGeo footage researchers describe what they need in plain English and find relevant assets; and a NatGeo Media Administrator grants/revokes **Uploader** and **Researcher** access. All employees sign in through enterprise SSO. Files live in S3, and an adapted version of REEL-FINDER powers semantic retrieval.
+MediaMesh is a secure internal media library where authorized employees upload photographs and videos, while authorized researchers use natural-language queries to locate relevant assets. An administrator assigns application roles. Employees authenticate through enterprise single sign-on (SSO); APIs validate JWT access tokens and enforce role-based access control (RBAC). Original files are held privately in Amazon S3. Metadata and vector embeddings are stored in PostgreSQL with pgvector. A standalone Python ML service provides CLIP-based multimodal embeddings, video-keyframe indexing, and semantic similarity retrieval.
 
-**The demonstrable outcome:** A researcher preparing a wildlife article can find the right photo or moment in a documentary clip without knowing its filename, and a user without Researcher access cannot search or retrieve that asset even by calling an API directly.
+**MVP objective:** Demonstrate one complete, secure enterprise workflow: **SSO → admin role assignment → authorized media upload → automatic indexing → authorized semantic search → secure preview/download**.
 
-### Concrete pilot scenario
+The goal is **minimum implementation effort**, not a custom distributed storage system or a broad AI platform. S3 provides managed object storage; no custom replication, Kafka, Kubernetes, service mesh, or agent framework is required for the MVP.
 
-A photo editor is preparing a feature on **elephants during the dry season**. The NatGeo library contains images from multiple shoots and a short documentary clip whose filename is `DSC_0842.mp4`. The researcher searches:
+## 2. Business problem and expected outcome
 
-> **“Elephants drinking at a watering hole at sunset.”**
+**Example scenario.** A NatGeo media researcher needs pictures or clips showing “elephants walking near a watering hole.” Searching filenames and manually maintained tags is slow and misses relevant assets. MediaMesh retrieves visually similar content while enforcing the permissions assigned by an administrator.
 
-MediaMesh retrieves visually related photographs and, if a video keyframe matches, a preview that opens at the approximate video timestamp. The researcher can inspect the **species**, **shoot location**, **capture date**, **photographer**, and **usage-rights note** that the uploader entered. A valid Researcher role is required to search, preview or download.
+**Business outcomes:**
+- Reduce time spent finding relevant visual media.
+- Centralize access to approved media and ownership metadata.
+- Ensure only permitted employees can upload, search, preview and download assets.
+- Provide a clear path from upload to searchable asset, including failure status and retry.
 
-The model searches **visual content**; it does *not* guarantee factual recognition of exact locations, capture dates or licensing rights. Those are explicit metadata fields.
+**Primary users:** Administrator, Media Uploader, Media Researcher. A single employee may hold more than one role. Users with no assigned role may authenticate but cannot use protected business operations.
 
-## 2. NatGeo employees and permissions
+## 3. MVP scope and explicit exclusions
 
-| Actor | Realistic responsibility in this pilot | What they do in MediaMesh |
-|---|---|---|
-| **Media Administrator** | Onboard and offboard editorial staff | Find a signed-in employee and assign/revoke Uploader or Researcher roles; inspect who has access |
-| **Media Uploader** (photographer / archive assistant) | Add new field photos and documentary footage | Upload images/videos and enter/edit source information and rights notes |
-| **Media Researcher** (editor / footage researcher) | Find assets for articles or production | Enter natural-language queries, filter on metadata, preview and download assets |
-| **Signed-in, unassigned employee** | Staff member without library permission | Can log in but receives access-denied responses for upload/search/download |
+| In scope (required for demo) | Out of scope (defer unless approved) |
+|---|---|
+| Federated OIDC SSO and JWT-protected API | Building a custom identity provider |
+| Admin-managed Uploader/Researcher roles | Complex organization-wide IAM workflows |
+| Private S3 uploads, previews and downloads | Custom distributed file replication |
+| Image semantic search with CLIP-compatible text/image embeddings | LLM agents, Ollama, MCP workflow orchestration |
+| Video search through selected keyframes and timestamps | Native temporal video-understanding model |
+| Asset metadata, status and access rules in PostgreSQL | Multi-tenant SaaS and elaborate per-asset ACL policy engine |
+| Content-similarity recommendation (“Related media”) | Personalized collaborative filtering |
+| Basic health checks, error handling and CI tests | Kafka, Kubernetes and service mesh |
 
-**RBAC decision:** Admin controls role grants. Admin privileges do **not** automatically grant upload or search permissions; a person can hold multiple roles when needed. We require only **three roles** and **one organization** for the MVP. We are *not* building per-project approval workflows or a full digital-rights management product.
+**Audio:** Audio may be stored as a file, but semantic *audio-content* search is not guaranteed in the MVP. Uploaded title/description metadata can be searched. Transcription or audio embeddings are an optional extension.
 
-| Operation | Admin | Uploader | Researcher | Unassigned |
-|---|:---:|:---:|:---:|:---:|
-| Assign / revoke user roles | Yes | No | No | No |
-| Upload photo or video | With Uploader role | Yes | No | No |
-| Edit owned asset metadata | With Uploader role | Yes | No | No |
-| Natural-language search | With Researcher role | No | Yes | No |
-| Preview / download an asset | With Researcher role | No | Yes | No |
+**Authorization choice for minimum effort:** Roles control operations globally. Restrict access to assets by owner/collection visibility only if a restricted-collection demonstration is a stakeholder requirement. Otherwise start with a single internal media library where all Researcher-role users can view approved assets.
 
-**Editorial access assumption for MVP:** Every indexed asset belongs to one internal searchable library and can be viewed by users with the Researcher role. This avoids designing restricted collections in v1. If stakeholders require confidential, embargoed or externally licensed content with different access groups, that becomes a **separate scope decision** and needs asset/collection-level authorization before such files are ingested.
-
-## 3. NatGeo-specific asset and search requirements
-
-### Asset record (one photo or documentary video)
-
-| Field | Example | Purpose |
-|---|---|---|
-| Asset ID | `NG-000184` | Stable internal reference |
-| Original file | `DSC_0842.mp4` | S3 object reference; never rely on filename as a search key |
-| Title | `Elephant herd at Okavango watering hole` | Human-readable catalog title |
-| Description / shot notes | `Elephants gather near water at sunset` | Text search / editorial context |
-| Media type | `video` | Image vs video treatment |
-| Species / subject | `African elephant` | Structured metadata filter |
-| Location | `Okavango Delta, Botswana` | Uploader-supplied location filter |
-| Capture date | `2025-08-14` | Uploader-supplied date filter |
-| Photographer / crew | `NatGeo field contributor` | Attribution |
-| Rights / usage note | `Internal editorial review; verify license before publication` | Informs human editorial review; **not** automated rights clearance |
-| Processing state | `UPLOADING / PROCESSING / READY / FAILED` | Shows whether media is searchable |
-| Video frame timestamps | `00:01:12`, `00:02:18` | Opens video near a matched keyframe |
-
-### MVP search experience
-
-- **Natural language:** “Snow leopard on a rocky ridge” returns visually similar images and video moments, including assets with unhelpful filenames.
-- **Structured filters:** Apply species, media type, location and date **only when these metadata values exist**. A query such as “lions in Kenya after 2022” should combine visual similarity with location/date filtering, not pretend the model inferred exact provenance.
-- **Result cards:** Show thumbnail, title, media type, location, capture date, attribution and link to preview.
-- **Related media:** An optional “Find similar” action searches the same embedding index, without a new personalization system.
-- **Preview/download:** Spring Boot checks the Researcher role and issues short-lived S3 presigned URLs; S3 objects are not public.
-
-**MVP media support:** Images have text-to-image semantic retrieval. Videos are represented by sampled frames, so they support *approximate visual-moment retrieval*. Audio files, speech transcription, native temporal video understanding and rights clearance are **out of scope** for the MVP.
-
-## 4. Proposed architecture — deliberately small
+## 4. Proposed logical system architecture
 
 ```mermaid
 flowchart TB
-    A["NatGeo staff: Admin, Uploader, Researcher"] --> WEB["MediaMesh React portal"]
-    WEB <-->|"OIDC sign-in"| IDP["Enterprise SSO identity provider"]
-    WEB -->|"HTTPS + JWT access token"| API["Spring Boot API: auth, RBAC, catalog, asset URLs"]
-    API -->|"Users, roles, metadata, jobs"| PG[("PostgreSQL + pgvector")]
-    API -->|"Short-lived upload / download URLs"| S3[("Private Amazon S3 bucket")]
-    WEB <-->|"Direct file transfer via presigned URL"| S3
-    API -->|"Semantic search query"| ML["Python retrieval service: reuse REEL-FINDER + CLIP"]
-    ML <-->|"Vector search"| PG
-    API -->|"Create indexing job"| PG
-    JOB["Python indexing task"] -->|"Claim queued job"| PG
-    JOB -->|"Fetch media"| S3
-    JOB -->|"Embed image / video keyframes"| ML
-    JOB -->|"Write vectors and status"| PG
+    U[Employees: Admin / Uploader / Researcher]
+    UI[React Web Portal]
+    IDP[Enterprise SSO / OIDC Identity Provider]
+    API[Spring Boot API<br/>JWT validation and RBAC]
+    DB[(PostgreSQL + pgvector<br/>Users / Roles / Assets / Vectors / Jobs)]
+    S3[(Private Amazon S3<br/>Original media / previews)]
+    ML[Python ML Service<br/>CLIP embeddings / similarity retrieval]
+    WORKER[Background indexer<br/>Python worker or task runner]
+
+    U --> UI
+    UI -->|OIDC sign-in| IDP
+    IDP -->|Authentication response| UI
+    UI -->|Bearer JWT + HTTPS| API
+    API -->|Fetch public signing keys as needed| IDP
+    API -->|Read and write users, roles, assets, jobs| DB
+    DB -->|Metadata and authorization results| API
+    API -->|Request presigned upload/download URLs| S3
+    UI -->|Upload/download using presigned URL| S3
+    S3 -->|Media response| UI
+    API -->|Authorize and request search| ML
+    ML -->|Vector similarity queries| DB
+    DB -->|Ranked vector matches| ML
+    WORKER -->|Fetch uploaded files| S3
+    WORKER -->|Generate embeddings| ML
+    WORKER -->|Update job and asset status| DB
+    API -->|Record durable index job| DB
 ```
 
-**Implementation boundary:** The Python indexing task and Python retrieval service can share a repository and image. No separate Kafka, SQS, Kubernetes, service mesh or custom distributed-storage engine is required. Keep S3 private and use its managed durability.
+**Deployment interpretation:** These are logical responsibilities, not necessarily separate microservices. The ML inference code and indexing worker may run from the same Python codebase. React, Spring Boot, Python and PostgreSQL can run in Docker Compose locally; S3 and the SSO provider are managed external services.
 
-## 5. Sequence diagrams — actual NatGeo user journeys
+### Component responsibilities
 
-### Flow A — Staff SSO login, JWT access and expiry
+| Component | Owns | Does not own |
+|---|---|---|
+| Identity provider | Employee authentication, SSO, OIDC protocol, token issuance | MediaMesh roles and media authorization |
+| React portal | Login redirect, upload and search UI, result presentation | Security enforcement |
+| Spring Boot API | JWT validation, role checks, asset lifecycle, presigned URLs, result authorization | Large binary file transfer or ML inference |
+| PostgreSQL + pgvector | User-role assignments, media metadata, processing jobs, vectors | Original media bytes |
+| S3 | Private object storage, managed durability | Semantic similarity search |
+| Python ML | Image/text embedding, keyframe processing, vector similarity, related items | Assigning user roles |
 
-**Example:** A NatGeo footage researcher opens the portal. Authentication proves their identity; MediaMesh separately checks whether they hold the Researcher role.
+## 5. Roles and access model
+
+| Action | Admin | Uploader | Researcher | Unassigned employee |
+|---|:---:|:---:|:---:|:---:|
+| View/manage user-role assignments | Yes | No | No | No |
+| Upload media | Optional* | Yes | No | No |
+| Edit own media metadata | Optional* | Yes | No | No |
+| Search media | Optional* | No | Yes | No |
+| Preview/download search results | Optional* | No | Yes | No |
+
+*For least privilege, **Admin is not implicitly a content user**. An admin can explicitly assign themselves Uploader or Researcher roles if needed. The table intentionally keeps administrative powers separate from content operations.
+
+**Access rule:** Every protected API endpoint validates identity *and* current effective roles. UI visibility is convenience only. Role assignment/revocation persists in the application database and is checked for every request, so a long-lived JWT containing old roles does not override a revocation. JWT contains identity and standard security claims; application roles remain authoritative in PostgreSQL.
+
+## 6. Primary sequence diagrams
+
+### Flow A — Employee SSO login, JWT APIs and session expiry
 
 ```mermaid
 sequenceDiagram
-    actor R as NatGeo Employee
-    participant W as React Portal
-    participant I as Enterprise IdP (OIDC)
-    participant B as Spring Boot API
-    participant D as PostgreSQL
-    R->>W: Open MediaMesh
-    W->>I: Redirect for SSO (OIDC Authorization Code + PKCE)
-    I-->>W: Complete sign-in and establish app session
-    W->>B: GET /api/me with access JWT
-    B->>B: Validate JWT signature, issuer, audience, expiry
-    B->>D: Look up user and current role assignments
-    D-->>B: Researcher role (or no assigned role)
-    B-->>W: Authenticated profile + permitted actions
-    Note over W,B: JWT is short-lived; app session has idle/absolute expiry
-    R->>W: Later request after access token expires
-    W->>B: API call with expired JWT
-    B-->>W: 401 Unauthorized
-    W->>I: Renew via supported secure session flow, or reauthenticate
-    Note over W,I: Logout ends local session; IdP logout depends on provider
-```
-
-**MVP security defaults to approve:** 15-minute access JWT; application idle timeout of 30 minutes; maximum application session of 8 hours; secure renewal handled by the chosen OIDC library/provider. Prefer secure HttpOnly cookies for server-managed session/renewal material; do not keep long-lived refresh tokens in browser localStorage. A revoked role is read from PostgreSQL on protected requests instead of trusting stale role claims in JWTs.
-
-### Flow B — Admin grants / revokes employee roles
-
-**Example:** The NatGeo archive manager gives a photographer Upload access and a video editor Research access.
-
-```mermaid
-sequenceDiagram
-    actor A as NatGeo Media Admin
-    participant W as React Admin Screen
-    participant B as Spring Boot API
-    participant D as PostgreSQL
-    A->>W: Open User Management
-    W->>B: GET /api/admin/users (JWT)
-    B->>B: Verify Admin role
-    B->>D: List provisioned users and roles
-    D-->>W: Employee directory entries and assignments
-    A->>W: Grant Uploader to photographer
-    W->>B: PUT /api/admin/users/{id}/roles
-    B->>B: Verify Admin and validate requested roles
-    B->>D: Commit updated roles + audit record
-    B-->>W: Updated role assignments
-    Note over B,D: Next protected request uses current DB roles
-    A->>W: Revoke Researcher from former editor
-    W->>B: Update role assignment
-    B->>D: Commit revocation
-    B-->>W: Revocation confirmed
-```
-
-Provision a user record when the person first logs in through SSO. For the MVP, admins assign roles to **already provisioned users**; automatic sync of every NatGeo directory user is unnecessary.
-
-### Flow C — Photographer uploads and indexes wildlife footage
-
-**Example:** An authorized uploader adds `DSC_0842.mp4`, titles it “Elephant herd at watering hole,” and records location, capture date and usage notes.
-
-```mermaid
-sequenceDiagram
-    actor U as NatGeo Media Uploader
-    participant W as React Upload Screen
-    participant B as Spring Boot API
-    participant D as PostgreSQL
-    participant S as Private S3
-    participant J as Python Indexing Task
-    participant M as ML / CLIP
-    U->>W: Choose video, enter species, location, rights note
-    W->>B: POST /api/assets/initiate (JWT + metadata)
-    B->>D: Check Uploader role; create asset UPLOADING
-    B-->>W: Asset ID + scoped, expiring S3 upload URL
-    W->>S: PUT original file directly to S3
-    S-->>W: Upload succeeded
-    W->>B: POST /api/assets/{id}/complete
-    B->>S: Verify object exists and expected details
-    B->>D: Set PROCESSING + persist indexing job
-    B-->>W: 202 Accepted; show Processing
-    J->>D: Claim pending job
-    J->>S: Read private media
-    J->>J: Extract representative video keyframes
-    J->>M: Generate image/frame embeddings
-    M-->>J: Embeddings
-    J->>D: Save vectors, timestamps; set READY
-    W->>B: GET /api/assets/{id}
-    B-->>W: READY / FAILED processing status
-    Note over J,D: Failed jobs stay visible and can be retried
-```
-
-**Scope cut:** Do not route large video bytes through Spring Boot. The uploader sends directly to S3. For MVP resilience, the Python worker polls a PostgreSQL jobs table; this is simpler than introducing a queueing service. Jobs need retry counts and a recoverable lease/timeout to prevent permanently stuck `PROCESSING` assets.
-
-### Flow D — Footage researcher performs natural-language search
-
-**Example:** An editor searches **“Elephants drinking at a watering hole at sunset”** and optionally filters to Botswana and video assets.
-
-```mermaid
-sequenceDiagram
-    actor R as NatGeo Footage Researcher
-    participant W as React Search Page
-    participant B as Spring Boot API
-    participant D as PostgreSQL + pgvector
-    participant M as Python Retrieval Service
-    R->>W: Enter description and optional metadata filters
-    W->>B: POST /api/search (JWT, query, filters)
-    B->>D: Verify current Researcher role
-    alt No Researcher role
-        B-->>W: 403 Forbidden
-    else Authorized
-        B->>M: Embed query + perform semantic retrieval
-        M->>M: CLIP text encoder
-        M->>D: Similarity search over READY image/frame vectors
-        D-->>M: Asset IDs, similarity scores, timestamps
-        M-->>B: Ranked candidate IDs
-        B->>D: Load authorized asset metadata and apply filters
-        D-->>B: Titles, species, locations, dates, thumbnails
-        B-->>W: Authorized search results (no public S3 URLs)
-        W-->>R: Photo cards + video keyframe matches
+    autonumber
+    actor Employee
+    participant Web as React Portal
+    participant IdP as OIDC SSO Provider
+    participant API as Spring Boot API
+    participant DB as PostgreSQL
+    Employee->>Web: Open MediaMesh and select Sign In
+    Web->>IdP: Authorization code flow with PKCE
+    IdP->>Employee: Authenticate through enterprise SSO
+    Employee->>IdP: Complete sign-in
+    IdP-->>Web: Authorization code
+    Web->>IdP: Exchange code securely for tokens
+    IdP-->>Web: ID/access tokens and expiry
+    Web->>API: GET /api/me with access JWT
+    API->>API: Validate signature, issuer, audience, expiry
+    API->>DB: Load current roles by identity subject
+    DB-->>API: Assigned roles
+    API-->>Web: Identity and authorized capabilities
+    Note over Web,IdP: Token/session expiry controlled by IdP and app settings
+    alt Access token expires and refresh is permitted
+        Web->>IdP: Renew using supported secure session mechanism
+        IdP-->>Web: New short-lived access token
+    else Renewal not available / session expired
+        Web->>Employee: Require SSO reauthentication
     end
 ```
 
-**Search truthfulness:** Visual similarity ranks candidate assets; title, species, location and date come from submitted metadata. Do not market inferred location/date as verified facts.
+**Security decisions:** OIDC Authorization Code + PKCE for the browser application; short-lived access JWTs; signature, `iss`, `aud`, and `exp` validation in Spring Security; protected tokens not stored in localStorage. Preferred implementation is a BFF/secure HttpOnly cookie or the identity provider's documented secure SPA flow. Application logout clears local session and requests IdP logout as supported. A locally cached JWT cannot automatically be revoked everywhere, so keep it short-lived and check RBAC against the database.
 
-### Flow E — Researcher previews or downloads selected media
-
-**Example:** The researcher opens an elephant video at the returned approximate timestamp and downloads the original for editorial review.
+### Flow B — Administrator assigns or revokes a role
 
 ```mermaid
 sequenceDiagram
-    actor R as NatGeo Researcher
-    participant W as React Results Page
-    participant B as Spring Boot API
-    participant D as PostgreSQL
-    participant S as Private S3
-    R->>W: Click Preview / Download on NG-000184
-    W->>B: POST /api/assets/{id}/access-url (JWT)
-    B->>D: Check current Researcher role and asset state
-    alt Not authorized or unavailable
-        B-->>W: 403 Forbidden / 404 Not Found
-    else Authorized
-        B->>B: Issue short-lived URL for exact S3 object
-        B-->>W: Presigned S3 URL + matched video timestamp
-        W->>S: Request file using temporary URL
-        S-->>W: Media bytes
-        W-->>R: Play video near matching timestamp / download
+    autonumber
+    actor Admin
+    participant Web as React Portal
+    participant API as Spring Boot API
+    participant DB as PostgreSQL
+    Admin->>Web: Open User Management
+    Web->>API: GET /api/admin/users with access JWT
+    API->>API: Validate JWT and require ADMIN role
+    API->>DB: Read users and role assignments
+    DB-->>API: User list
+    API-->>Web: User/role data
+    Admin->>Web: Assign UPLOADER or RESEARCHER
+    Web->>API: PUT /api/admin/users/{id}/roles
+    API->>API: Validate JWT and require ADMIN role
+    API->>DB: Save role assignment and audit event
+    DB-->>API: Commit successful
+    API-->>Web: Updated roles
+    Note over API,DB: Next request reads current roles
+    Note over API,DB: Changes apply before JWT expiry
+```
+
+**Failure behavior:** A user without `ADMIN` gets HTTP `403`. Missing/expired/invalid JWT gets HTTP `401`. Admin cannot grant arbitrary unsupported role names.
+
+### Flow C — Media upload and semantic indexing
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Uploader
+    participant Web as React Portal
+    participant API as Spring Boot API
+    participant DB as PostgreSQL
+    participant S3 as Private S3
+    participant Worker as Indexing Worker
+    participant ML as Python ML Service
+    Uploader->>Web: Select image/video and enter metadata
+    Web->>API: POST /api/assets/initiate with JWT and metadata
+    API->>API: Validate JWT and require UPLOADER
+    API->>DB: Create asset with UPLOADING status
+    API-->>Web: Asset ID + short-lived S3 upload URL
+    Web->>S3: Upload bytes directly via presigned URL
+    S3-->>Web: Upload success
+    Web->>API: POST /api/assets/{id}/complete with JWT
+    API->>S3: Verify object exists / expected type and size
+    API->>DB: Commit asset PROCESSING + durable indexing job
+    API-->>Web: Accepted with PROCESSING status
+    Worker->>DB: Claim next pending indexing job
+    Worker->>S3: Read asset (private service credentials)
+    opt Video
+        Worker->>Worker: Extract sampled frames and timestamps
+    end
+    Worker->>ML: Generate CLIP image/frame embeddings
+    ML-->>Worker: Embeddings
+    Worker->>DB: Upsert vectors and mark asset READY
+    Web->>API: GET /api/assets/{id}/status with JWT
+    API-->>Web: READY
+    alt Processing fails
+        Worker->>DB: Record failure and retry count
+        Note over Worker,DB: Retry with bounded attempts and mark FAILED after limit
     end
 ```
 
-**Important:** Presigned URLs remain usable until their own expiration even after a role is revoked. Use a short expiration (proposed: **60 seconds**) and issue URLs only after current authorization. A time-limited URL is not instantaneous revocation.
+**Reliability choice:** A minimal **database-backed indexing job**, not a volatile in-process callback, prevents lost work after restart without introducing SQS. Each job is idempotent by asset ID + model version. Support manual retry for `FAILED` assets. Set file-type/size limits, use private buckets and reject unexpected content.
 
-## 6. Minimum data model
+### Flow D — Authorized natural-language semantic search
 
-| Table | Fields needed for this NatGeo pilot |
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Researcher
+    participant Web as React Portal
+    participant API as Spring Boot API
+    participant DB as PostgreSQL
+    participant ML as Python ML Service
+    Researcher->>Web: Search "elephants near a watering hole"
+    Web->>API: POST /api/search with query and JWT
+    API->>API: Validate JWT and require RESEARCHER
+    API->>DB: Resolve user's allowed asset scope
+    DB-->>API: Effective visibility rules
+    API->>ML: Search with query + allowed scope
+    ML->>ML: Embed natural-language text (CLIP text encoder)
+    ML->>DB: Vector similarity query within allowed scope
+    DB-->>ML: Ranked asset/frame IDs + scores
+    ML-->>API: Candidate results and timestamps
+    API->>DB: Re-check result access and retrieve metadata
+    DB-->>API: Authorized asset metadata
+    API-->>Web: Ranked results, thumbnails, matching video timestamps
+    Note over Web,API: Never return unauthorized asset IDs, metadata or URLs.
+```
+
+**MVP retrieval:** CLIP-compatible text and image embeddings are in the same space. Images have one or more vectors; videos are indexed using a limited number of keyframes. The standalone Python ML service encodes natural-language queries and stored images using a compatible CLIP model, ranks candidates via pgvector, and returns only asset IDs, scores, and frame timestamps to the Spring Boot API. A user can request **related media** by searching with the chosen asset's embedding.
+
+### Flow E — Authorized preview/download, expiration and denial
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Researcher
+    participant Web as React Portal
+    participant API as Spring Boot API
+    participant DB as PostgreSQL
+    participant S3 as Private S3
+    Researcher->>Web: Open a search result
+    Web->>API: POST /api/assets/{id}/access-url with JWT
+    API->>API: Validate JWT and require RESEARCHER
+    API->>DB: Verify this asset is visible to the user
+    alt Authorized
+        DB-->>API: Allowed
+        API-->>Web: Short-lived presigned S3 GET URL
+        Web->>S3: GET media/preview using signed URL
+        S3-->>Web: Media bytes
+    else Not authorized
+        DB-->>API: Denied
+        API-->>Web: 403 Forbidden
+    end
+    Note over Web,S3: Presigned URLs expire, S3 objects remain private.
+```
+
+**Important limitation:** An already issued S3 presigned URL can remain usable until its short expiry even if an admin revokes access moments later. Keep expiry brief and do not expose URLs to unrelated users. Stronger immediate revocation would require proxying content through a permission-checking service, which is outside this MVP.
+
+## 7. Minimal data model
+
+```mermaid
+erDiagram
+    USER ||--o{ USER_ROLE : has
+    ROLE ||--o{ USER_ROLE : assigned
+    USER ||--o{ ASSET : uploads
+    ASSET ||--o{ ASSET_EMBEDDING : indexed_as
+    ASSET ||--o{ INDEX_JOB : processed_by
+    USER {
+        uuid id PK
+        string oidc_subject UK
+        string email
+    }
+    ROLE {
+        string name PK
+    }
+    USER_ROLE {
+        uuid user_id FK
+        string role_name FK
+    }
+    ASSET {
+        uuid id PK
+        uuid owner_id FK
+        string s3_key
+        string media_type
+        string title
+        string description
+        string status
+        datetime uploaded_at
+    }
+    ASSET_EMBEDDING {
+        uuid id PK
+        uuid asset_id FK
+        float timestamp_seconds
+        string model_version
+        vector embedding
+    }
+    INDEX_JOB {
+        uuid id PK
+        uuid asset_id FK
+        string status
+        int attempts
+        datetime updated_at
+    }
+```
+
+For the lean MVP, roles are application-managed; user authentication remains managed by the IdP. Add `collection_id` and collection membership/visibility data **only if** restricted collections are approved as required scope. Avoid implementing asset-specific grants and multi-tenancy by default.
+
+## 8. Standalone multimodal semantic retrieval service
+
+The Python ML service is a **standalone MediaMesh component** built for the NatGeo-style media library. It exposes internal endpoints to the Spring Boot API and runs a background worker to index uploaded media. The browser cannot invoke the ML API directly.
+
+| Component | MVP responsibility |
 |---|---|
-| `users` | `id`, `oidc_subject`, `email`, `display_name` |
-| `user_roles` | `user_id`, `role` (ADMIN / UPLOADER / RESEARCHER), `assigned_by`, `assigned_at` |
-| `assets` | `id`, `owner_id`, `s3_key`, `media_type`, `title`, `description`, `species`, `location`, `captured_at`, `contributor`, `usage_note`, `processing_status` |
-| `asset_vectors` | `asset_id`, `frame_timestamp_seconds` (nullable for photos), `model_version`, `embedding` |
-| `index_jobs` | `asset_id`, `status`, `attempts`, `last_error`, `lease_until` |
-| `audit_events` | `actor_user_id`, `action`, `target_id`, `timestamp`, `outcome` (especially role changes and downloads) |
+| Python Flask API | Implement internal semantic search and optional related-media retrieval |
+| CLIP-compatible model | Generate text and image embeddings in one shared vector space |
+| FFmpeg keyframe extractor | Sample a limited number of frames from short video clips and record timestamps |
+| PostgreSQL + pgvector | Persist versioned asset/frame vectors and run similarity queries |
+| Background indexing worker | Claim durable jobs, fetch media privately from S3, upsert vectors, and update processing status |
+| Ranking and retrieval | Return ranked asset IDs, similarity scores, and optional video timestamps |
 
-A small audit table is worth retaining for enterprise credibility; a full SIEM integration is not necessary. Avoid recording sensitive search text or secrets in audit records.
+### Internal ML contract
 
-## 7. Reuse REEL-FINDER rather than rebuilding search
+`POST /internal/search` accepts a natural-language query and requested result limit. It returns only ranked candidates; it does not issue public media links or decide user roles.
 
-| REEL-FINDER capability | NatGeo adaptation | Decision |
+```json
+{
+  "query": "elephants drinking at a watering hole at sunset",
+  "limit": 20
+}
+```
+
+```json
+{
+  "matches": [
+    {"assetId": "example-asset-id", "score": 0.83, "frameTimestampSeconds": 72},
+    {"assetId": "example-image-id", "score": 0.79, "frameTimestampSeconds": null}
+  ]
+}
+```
+
+The Spring Boot endpoint `POST /api/search` performs JWT and role validation, calls the internal ML endpoint, and performs a final authorized asset and metadata lookup before returning results to the user. The ML endpoint stays private. **No existing external recommendation engine is a documented project dependency.**
+
+### Model and indexing constraints
+
+- Use one explicitly versioned compatible CLIP text/image model and record embedding dimensionality in configuration and migrations.
+- Generate one vector for an image and separately indexed timestamped keyframes for videos.
+- Support idempotent reindexing by asset, model version, and frame position.
+- Keep only a small evaluation set of images/videos for the MVP; avoid native audio embeddings and expensive video understanding.
+- Teammate 2 owns asset metadata and indexing-job schema; Teammate 3 owns vectors, ML inference, and worker execution. Agree on job claiming and state transitions before integration.
+
+## 9. Security, failure handling and operating assumptions
+
+- **Identity:** Use one OIDC-capable SSO provider; no password database in MediaMesh.
+- **JWT:** Validate signed access tokens on every protected API; reject expired tokens with `401`.
+- **RBAC:** Persist role assignments centrally; enforce on each business endpoint (`403` if authenticated but unauthorized).
+- **Session:** Agree on access-token lifetime, session idle limit and reauthentication behavior before implementation; do not choose values implicitly. Secure cookie/BFF is preferred if its implementation burden fits.
+- **Storage:** S3 bucket is private, with least-privilege IAM credentials and presigned URLs for time-limited client access.
+- **Metadata:** Store S3 keys, ownership, statuses and versioned embeddings; avoid storing binary media in PostgreSQL.
+- **Processing:** Durable database jobs, bounded retries, idempotent indexing and visible processing errors.
+- **Observability:** Structured logs, API health checks and minimal audit events for role changes and media actions.
+- **Deployment:** Docker Compose for local development and demonstration; managed S3/identity services. Jenkins builds and tests on GitHub changes.
+
+## 10. Minimum acceptance criteria
+
+| Scenario | Acceptance criterion |
+|---|---|
+| Employee signs in | Enterprise SSO completes; API accepts valid JWT and rejects expired/invalid JWT (`401`). |
+| Admin assigns role | Only Admin can grant/revoke roles; updated privileges take effect on subsequent calls. |
+| Unauthorized upload/search | Authenticated user lacking required role receives `403`. |
+| Authorized upload | Image/video stored privately in S3; metadata persisted and indexing status visible. |
+| Semantic image search | Natural-language query returns relevant indexed images from a curated evaluation set. |
+| Semantic video search | Query returns relevant video and representative matching timestamp/keyframe. |
+| Secure media retrieval | Only authorized users receive short-lived media URLs; S3 bucket is not public. |
+| Background job failure | Failed indexing is visible and can be retried without duplicate asset records. |
+| Engineering workflow | Services run via documented Docker setup; CI runs builds and tests. |
+
+**Suggested demonstration:** Admin grants Uploader and Researcher roles; Uploader adds wildlife images and a short clip; indexing completes; Researcher searches “elephants near a watering hole” and previews matches; unassigned user is denied search; demonstrate expired JWT and revoked role handling.
+
+## 11. Decisions requested from stakeholders
+
+| Decision | Recommended MVP default | Alternative / impact |
 |---|---|---|
-| Python retrieval service | Maintain as MediaMesh ML service | **Reuse** |
-| Sentence Transformers inference pattern | Use a compatible multimodal CLIP text/image encoder | **Adapt** |
-| Vector similarity and ranking | Search asset/frame embeddings, return stable asset IDs | **Reuse approach** |
-| FAISS indexing | Proof-of-concept possible; pgvector preferred for app persistence | **Replace for integrated MVP** |
-| Movie titles, ratings, genres | NatGeo species, location, capture date and rights notes | **Replace domain data** |
-| Personalized movie recommendations | Similar visual media from the same embeddings | **Simplify** |
-| Ollama agent / FastMCP | Not needed to search visually by text | **Defer** |
+| Is NatGeo illustrative or the actual client? | Illustrative scenario with sample or licensed content | Actual integration requires enterprise approval, legal/data review |
+| Role separation | Admin, Uploader, Researcher; multiple roles per user | Combining roles simplifies UI but weakens demonstration |
+| Asset visibility | All approved internal assets searchable by Researchers | Restricted collections add a permissions data model and tests |
+| SSO provider | One supported OIDC provider, ideally existing team access | Deploying Keycloak adds local infrastructure |
+| Session behavior | Short-lived JWT + secure renewal or re-login | Exact idle/absolute expiry values to decide |
+| Media scope | Image semantic search + video keyframes | Native audio semantics and detailed video models are deferred |
+| Vector storage | PostgreSQL + pgvector | FAISS requires separate persistence/permissions integration |
+| Indexing reliability | Database-backed job table | SQS adds AWS infrastructure and operational setup |
+| Deployment | Docker Compose + S3 + hosted IdP | Cloud deployment separately if specifically graded |
+| CI/CD | GitHub + Jenkins pipeline | Other CI services only if course permits |
 
-**Critical modeling constraint:** Existing movie-text MiniLM vectors cannot be compared directly to CLIP image vectors. Re-embed NatGeo visual assets and their text queries using compatible encoders from the same multimodal model family.
+**Recommendation:** Approve the MVP above, choose a single SSO provider, decide whether restricted collections are essential, and agree on session-expiry rules. Only after these decisions should tasks be allocated across the team.
 
-## 8. Build order and acceptance criteria
+## 12. Non-goals and project success boundary
 
-| Phase | Minimum working result | Evidence for stakeholder demo |
-|---|---|---|
-| **1. Semantic proof** | Existing Python service embeds 20 wildlife photos; text query finds matches | Search “elephant at watering hole” without filename tags |
-| **2. Catalog + S3** | Upload photo/video to private S3; persist metadata; auto-index image/video frames | Upload `DSC_0842.mp4`, see PROCESSING then READY |
-| **3. Enterprise security** | OIDC SSO, Admin grants roles, JWT validation, expiration | Unassigned user fails search; admin grants Researcher; request succeeds |
-| **4. End-to-end polish** | React upload/search results, preview/download, CI tests, basic failure recovery | Full editor journey and one failed/retried indexing job |
+MediaMesh is **not** rebuilding S3, training a multimodal foundation model, building a generalized autonomous agent, or delivering a production-grade National Geographic integration. It is a demonstrable enterprise-style application built around managed identity, role-enforced APIs, secure media storage and a standalone multimodal semantic retrieval service.
 
-### Demo pass/fail checklist
-
-- [ ] A new SSO-authenticated employee has **no** default upload/search access.
-- [ ] Admin grants Uploader or Researcher role; only then can the corresponding API be called.
-- [ ] Expired JWT is rejected with `401`; valid JWT without permission receives `403`.
-- [ ] A contributor uploads `DSC_0842.mp4` directly to **private** S3 and supplies species/location/rights metadata.
-- [ ] Image and extracted video-keyframe embeddings become searchable after processing.
-- [ ] “Elephants drinking at a watering hole at sunset” finds related visuals without relying on the filename.
-- [ ] Results show uploader-supplied provenance fields and approximate video timestamps.
-- [ ] Preview/download URL is issued only to a currently authorized Researcher and expires quickly.
-- [ ] Revoking Researcher prevents subsequent search and new URL issuance, even if the JWT is still valid.
-- [ ] At least one indexing failure can be surfaced and retried; basic build/tests run in CI.
-
-## 9. Decisions for the stakeholder meeting
-
-| Decision | Lean proposal | What changes if rejected |
-|---|---|---|
-| **Target customer workflow** | Internal NatGeo-style wildlife editorial catalog | Redesign asset fields and user journeys if targeting public consumers or external licensing |
-| **SSO provider** | One OIDC provider with a real federated SSO demonstration where feasible | Local dev provider can prove OIDC but is not itself proof of enterprise federation |
-| **Permissions** | Three assigned roles; one searchable internal library | Confidential/embargoed collections require additional object-level authorization design |
-| **Media scope** | Photos + video keyframe search | Audio transcription / temporal models increase ML workload |
-| **Data / retrieval** | PostgreSQL + pgvector; private S3 | Alternative vector store or object store adds integration overhead |
-| **Operational scope** | Docker Compose, one Python indexing worker, CI, retryable jobs | Managed event infrastructure / Kubernetes increases deployment work |
-| **Rights metadata** | Display human-entered usage notes; human verifies publication eligibility | Automated license compliance is a separate project |
-
-## 10. Explicitly excluded from the MVP
-
-- Public NatGeo website integration, external publishing APIs or automatic publication approval.
-- Per-asset legal rights enforcement, licensing marketplace, or content moderation engine.
-- Confidential/embargoed media with per-project ACLs unless explicitly added as a requirement.
-- Speech transcription, audio similarity search, detailed video-scene understanding.
-- Multi-organization tenancy, custom S3 replication logic, Kafka, Kubernetes, service mesh or LLM agent.
-
-**Proposed sign-off:** Approve the role matrix, sample editorial workflow, image/video semantic-search scope, SSO provider and single shared-library access assumption. Only then split tasks among teammates.
+**MVP is complete when the end-to-end demonstration works securely, is reproducible, and meets the acceptance criteria in §10.**
