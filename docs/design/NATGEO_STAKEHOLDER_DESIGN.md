@@ -1,8 +1,8 @@
 # MediaMesh — Enterprise Media Discovery Platform
 
-**Solution design proposal | Stakeholder review | Version 0.2 | 8 November 2026**  
+**Solution design proposal | Stakeholder review | Version 0.3 | 8 November 2026**  
 **Illustrative organization:** National Geographic (NatGeo-style use case; not an actual NatGeo integration)  
-**Status:** Proposed architecture — decisions pending
+**Status:** Proposed architecture — pending approval of the decisions in Section 11. This is the authoritative MVP design; the companion background document is non-normative.
 
 ## 1. Executive summary
 
@@ -37,15 +37,17 @@ The goal is **minimum implementation effort**, not a custom distributed storage 
 | Content-similarity recommendation (“Related media”) | Personalized collaborative filtering |
 | Basic health checks, error handling and CI tests | Kafka, Kubernetes and service mesh |
 
-**Audio:** Audio may be stored as a file, but semantic *audio-content* search is not guaranteed in the MVP. Uploaded title/description metadata can be searched. Transcription or audio embeddings are an optional extension.
+**Audio:** Audio-content search and audio ingestion are deferred. The MVP accepts photographs and short video clips only, keeping the upload/indexing contract consistent with the team assignments.
 
 **Authorization choice for minimum effort:** Roles control operations globally. Restrict access to assets by owner/collection visibility only if a restricted-collection demonstration is a stakeholder requirement. Otherwise start with a single internal media library where all Researcher-role users can view approved assets.
 
 ## 4. Proposed logical system architecture
 
+This is the source-of-truth architecture for the MVP. Implementations must follow the API contract in Section 8 and the shared team overview. The background document explains decisions only.
+
 ```mermaid
 flowchart TB
-    U[Employees: Admin / Uploader / Researcher]
+    U["Employees: Admin / Uploader / Researcher"]
     UI[React Web Portal]
     IDP[Enterprise SSO / OIDC Identity Provider]
     API[Spring Boot API<br/>JWT validation and RBAC]
@@ -58,17 +60,17 @@ flowchart TB
     UI -->|OIDC sign-in| IDP
     IDP -->|Authentication response| UI
     UI -->|Bearer JWT + HTTPS| API
-    API -->|Fetch public signing keys as needed| IDP
+    API -.->|Fetch and cache signing keys as needed| IDP
     API -->|Read and write users, roles, assets, jobs| DB
     DB -->|Metadata and authorization results| API
-    API -->|Request presigned upload/download URLs| S3
+    API -.->|Generate presigned URLs with AWS SDK| S3
     UI -->|Upload/download using presigned URL| S3
     S3 -->|Media response| UI
     API -->|Authorize and request search| ML
     ML -->|Vector similarity queries| DB
     DB -->|Ranked vector matches| ML
     WORKER -->|Fetch uploaded files| S3
-    WORKER -->|Generate embeddings| ML
+    WORKER -->|Invoke shared Python embedding code| ML
     WORKER -->|Update job and asset status| DB
     API -->|Record durable index job| DB
 ```
@@ -133,7 +135,7 @@ sequenceDiagram
     end
 ```
 
-**Security decisions:** OIDC Authorization Code + PKCE for the browser application; short-lived access JWTs; signature, `iss`, `aud`, and `exp` validation in Spring Security; protected tokens not stored in localStorage. Preferred implementation is a BFF/secure HttpOnly cookie or the identity provider's documented secure SPA flow. Application logout clears local session and requests IdP logout as supported. A locally cached JWT cannot automatically be revoked everywhere, so keep it short-lived and check RBAC against the database.
+**Security decisions:** OIDC Authorization Code + PKCE with a supported SPA client library; short-lived access JWTs; signature, `iss`, `aud`, and `exp` validation in Spring Security; tokens kept in memory rather than localStorage. Renewal follows the selected identity provider's supported secure session flow. Application logout clears local credentials and requests IdP logout as supported. The proposed 15-minute access token, 30-minute idle limit, and 8-hour maximum login session are targets to approve and test, not guaranteed library defaults. Check RBAC against the database on every protected operation.
 
 ### Flow B — Administrator assigns or revokes a role
 
@@ -192,13 +194,14 @@ sequenceDiagram
     end
     Worker->>ML: Generate CLIP image/frame embeddings
     ML-->>Worker: Embeddings
-    Worker->>DB: Upsert vectors and mark asset READY
-    Web->>API: GET /api/assets/{id}/status with JWT
-    API-->>Web: READY
-    alt Processing fails
-        Worker->>DB: Record failure and retry count
-        Note over Worker,DB: Retry with bounded attempts and mark FAILED after limit
+    alt Indexing succeeds
+        Worker->>DB: Upsert vectors and mark asset READY
+    else Indexing fails
+        Worker->>DB: Record error and retry count
+        Note over Worker,DB: Retry bounded times and mark FAILED after limit
     end
+    Web->>API: GET /api/assets/{id}/status with JWT
+    API-->>Web: Return READY, PROCESSING or FAILED
 ```
 
 **Reliability choice:** A minimal **database-backed indexing job**, not a volatile in-process callback, prevents lost work after restart without introducing SQS. Each job is idempotent by asset ID + model version. Support manual retry for `FAILED` assets. Set file-type/size limits, use private buckets and reject unexpected content.
@@ -216,20 +219,20 @@ sequenceDiagram
     Researcher->>Web: Search "elephants near a watering hole"
     Web->>API: POST /api/search with query and JWT
     API->>API: Validate JWT and require RESEARCHER
-    API->>DB: Resolve user's allowed asset scope
-    DB-->>API: Effective visibility rules
-    API->>ML: Search with query + allowed scope
+    API->>DB: Load READY asset filters for single pilot library
+    DB-->>API: Valid metadata filter values
+    API->>ML: Search with query and requested candidate limit
     ML->>ML: Embed natural-language text (CLIP text encoder)
-    ML->>DB: Vector similarity query within allowed scope
+    ML->>DB: Retrieve candidate vectors from READY assets
     DB-->>ML: Ranked asset/frame IDs + scores
     ML-->>API: Candidate results and timestamps
-    API->>DB: Re-check result access and retrieve metadata
+    API->>DB: Filter READY assets and requested metadata
     DB-->>API: Authorized asset metadata
     API-->>Web: Ranked results, thumbnails, matching video timestamps
     Note over Web,API: Never return unauthorized asset IDs, metadata or URLs.
 ```
 
-**MVP retrieval:** CLIP-compatible text and image embeddings are in the same space. Images have one or more vectors; videos are indexed using a limited number of keyframes. The standalone Python ML service encodes natural-language queries and stored images using a compatible CLIP model, ranks candidates via pgvector, and returns only asset IDs, scores, and frame timestamps to the Spring Boot API. A user can request **related media** by searching with the chosen asset's embedding.
+**MVP retrieval:** Researcher role grants access to all READY assets in the one pilot library. PostgreSQL metadata filters are applied by the API after vector retrieval; to reduce missed matches, the ML service should request more candidates than the final result limit. Strict filtered top-K search can be added later. CLIP-compatible text and image embeddings are in the same space. Images have one or more vectors; videos are indexed using a limited number of keyframes. The standalone Python ML service encodes natural-language queries and stored images using a compatible CLIP model, ranks candidates via pgvector, and returns only asset IDs, scores, and frame timestamps to the Spring Boot API. A user can request **related media** by searching with the chosen asset's embedding.
 
 ### Flow E — Authorized preview/download, expiration and denial
 
@@ -266,7 +269,7 @@ erDiagram
     USER ||--o{ USER_ROLE : has
     ROLE ||--o{ USER_ROLE : assigned
     USER ||--o{ ASSET : uploads
-    ASSET ||--o{ ASSET_EMBEDDING : indexed_as
+    ASSET ||--o{ ASSET_VECTOR : indexed_as
     ASSET ||--o{ INDEX_JOB : processed_by
     USER {
         uuid id PK
@@ -290,12 +293,12 @@ erDiagram
         string status
         datetime uploaded_at
     }
-    ASSET_EMBEDDING {
+    ASSET_VECTOR {
         uuid id PK
         uuid asset_id FK
         float timestamp_seconds
         string model_version
-        vector embedding
+        string embedding_reference
     }
     INDEX_JOB {
         uuid id PK
@@ -306,7 +309,7 @@ erDiagram
     }
 ```
 
-For the lean MVP, roles are application-managed; user authentication remains managed by the IdP. Add `collection_id` and collection membership/visibility data **only if** restricted collections are approved as required scope. Avoid implementing asset-specific grants and multi-tenancy by default.
+The `embedding_reference` label represents the PostgreSQL `vector` column, whose exact dimensions and model version will be fixed in the ML migration; it is shown as a string in this conceptual ER diagram for broad Mermaid compatibility. For the lean MVP, roles are application-managed; user authentication remains managed by the IdP. Add `collection_id` and collection membership/visibility data **only if** restricted collections are approved as required scope. Avoid implementing asset-specific grants and multi-tenancy by default.
 
 ## 8. Standalone multimodal semantic retrieval service
 
@@ -320,6 +323,22 @@ The Python ML service is a **standalone MediaMesh component** built for the NatG
 | PostgreSQL + pgvector | Persist versioned asset/frame vectors and run similarity queries |
 | Background indexing worker | Claim durable jobs, fetch media privately from S3, upsert vectors, and update processing status |
 | Ranking and retrieval | Return ranked asset IDs, similarity scores, and optional video timestamps |
+
+### Public API contract (Spring Boot)
+
+| Endpoint | Required role | Responsibility |
+|---|---|---|
+| `GET /api/me` | Signed-in employee | Current profile and application roles |
+| `GET /api/admin/users` | `ADMIN` | List users and their roles |
+| `PUT /api/admin/users/{id}/roles` | `ADMIN` | Replace a user's roles and audit change |
+| `POST /api/assets/initiate` | `UPLOADER` | Record media metadata and issue presigned S3 PUT URL |
+| `POST /api/assets/{id}/complete` | `UPLOADER` and asset owner | Verify upload and queue indexing job |
+| `GET /api/assets/{id}` | Appropriate upload/search permission | Return metadata and processing state |
+| `GET /api/assets/{id}/status` | `UPLOADER` and asset owner, or `RESEARCHER` | Return asset processing state |
+| `POST /api/search` | `RESEARCHER` | Semantic search and optional metadata filters |
+| `POST /api/assets/{id}/access-url` | `RESEARCHER` | Authorize and issue short-lived S3 GET URL |
+
+Unauthorized or expired token: `401`. Authenticated but insufficient role: `403`. Internal ML endpoints are never browser accessible.
 
 ### Internal ML contract
 
@@ -356,7 +375,7 @@ The Spring Boot endpoint `POST /api/search` performs JWT and role validation, ca
 - **Identity:** Use one OIDC-capable SSO provider; no password database in MediaMesh.
 - **JWT:** Validate signed access tokens on every protected API; reject expired tokens with `401`.
 - **RBAC:** Persist role assignments centrally; enforce on each business endpoint (`403` if authenticated but unauthorized).
-- **Session:** Agree on access-token lifetime, session idle limit and reauthentication behavior before implementation; do not choose values implicitly. Secure cookie/BFF is preferred if its implementation burden fits.
+- **Session:** Use the IdP-supported SPA OIDC Authorization Code + PKCE flow for the MVP, with JWTs held in memory. Propose a 15-minute access token, 30-minute inactivity threshold, and 8-hour maximum login session; validate enforceability against the chosen provider and client before promising these limits in the demo. No custom refresh-token service or localStorage token persistence.
 - **Storage:** S3 bucket is private, with least-privilege IAM credentials and presigned URLs for time-limited client access.
 - **Metadata:** Store S3 keys, ownership, statuses and versioned embeddings; avoid storing binary media in PostgreSQL.
 - **Processing:** Durable database jobs, bounded retries, idempotent indexing and visible processing errors.
@@ -387,14 +406,14 @@ The Spring Boot endpoint `POST /api/search` performs JWT and role validation, ca
 | Role separation | Admin, Uploader, Researcher; multiple roles per user | Combining roles simplifies UI but weakens demonstration |
 | Asset visibility | All approved internal assets searchable by Researchers | Restricted collections add a permissions data model and tests |
 | SSO provider | One supported OIDC provider, ideally existing team access | Deploying Keycloak adds local infrastructure |
-| Session behavior | Short-lived JWT + secure renewal or re-login | Exact idle/absolute expiry values to decide |
+| Session behavior | SPA OIDC with short-lived JWT; proposed 15m access, 30m idle, 8h absolute | Confirm enforcement with selected IdP; BFF is deferred |
 | Media scope | Image semantic search + video keyframes | Native audio semantics and detailed video models are deferred |
 | Vector storage | PostgreSQL + pgvector | FAISS requires separate persistence/permissions integration |
 | Indexing reliability | Database-backed job table | SQS adds AWS infrastructure and operational setup |
 | Deployment | Docker Compose + S3 + hosted IdP | Cloud deployment separately if specifically graded |
 | CI/CD | GitHub + Jenkins pipeline | Other CI services only if course permits |
 
-**Recommendation:** Approve the MVP above, choose a single SSO provider, decide whether restricted collections are essential, and agree on session-expiry rules. Only after these decisions should tasks be allocated across the team.
+**Recommendation:** Approve the MVP above, select a single SSO provider and verify the proposed expiry behavior. Restricted collections are excluded unless specifically required. Existing teammate workstreams can proceed after the shared API and job contracts are confirmed.
 
 ## 12. Non-goals and project success boundary
 
